@@ -1,0 +1,20 @@
+#!/bin/bash
+
+echo "start"
+date
+
+idf.py build
+if [ $? -gt 0 ]; then
+	echo "exit"
+	exit 1
+fi
+
+ssh saric@192.168.2.1 "cat /var/www/html/monitor/v3.bin | md5sum"
+
+md5sum build/energy-monitor.bin
+
+scp build/energy-monitor.bin saric@192.168.2.1:/var/www/html/monitor/v3.bin
+
+mosquitto_pub -h 192.168.2.1 -t "/monitor-in/MONITOR1/bootloader" -m "0"
+
+echo "done"
