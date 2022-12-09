@@ -78,10 +78,11 @@
 #define bootloader_tag 0
 #define set_default_values 90
 
+extern char *TAG; 
+
 extern uint32_t wifi_link;
 extern uint32_t eth_link;
 extern uint32_t mqtt_link;
-extern uint32_t uptime;
 
 extern esp_netif_t *eth_netif;
 extern esp_netif_t *wifi_netif;
@@ -95,10 +96,12 @@ void send_know_device(void);
 void send_device_status(void);
 void send_energy_status(void);
 
+void get_device_status(void);
+
 void mqtt_callback(char* topic, uint8_t * payload, unsigned int length_topic, unsigned int length_data);
 bool mqtt_reconnect(void);
 
-long int millis(void);
+uint32_t  millis(void);
 
 
 void get_sha256_of_partitions(void);

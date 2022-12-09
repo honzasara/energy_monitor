@@ -9,7 +9,8 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
-
+#include "cJSON.h"
+#include "esp_log.h"
 
 #define adc_input_store_size_byte 26
 
@@ -77,7 +78,7 @@ typedef struct struct_energy
   uint8_t volt;
   uint32_t checkpoint;
   uint8_t flags;
-}struct_energy_t;
+} struct_energy_t;
 
 
 void energy_set_flag(uint8_t idx, uint8_t flag_id, uint8_t value);
@@ -90,6 +91,10 @@ void energy_struct_init_idx(uint8_t idx);
 void energy_struct_default_init(void);
 void energy_struct_default_init_idx(uint8_t idx);
 
+void energy_struct_fresh_idx(uint8_t idx);
+void energy_dump_config(uint8_t idx);
+
+
 void energy_get_parametr(uint8_t idx, struct_energy_t *energyx);
 void energy_set_parametr(uint8_t idx, struct_energy_t energyx);
 void energy_get_all_parametr(uint8_t idx, struct_energy_t *energyx);
@@ -100,6 +105,8 @@ void energy_store_get_all(uint8_t idx, struct_energy_t *energyx);
 
 void energy_store_update_mess(uint8_t idx, struct_energy_t energyx);
 void energy_store_update_all_mess(uint32_t epoch_time);
+
+void energy_set_all_from_json(uint8_t idx, cJSON *json_energy);
 
 #endif
 

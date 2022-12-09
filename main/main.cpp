@@ -1,7 +1,6 @@
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 #pragma GCC diagnostic ignored "-Wwrite-strings"
 
-
 #include "main.h"
 
 #include "nvs.h"
@@ -29,7 +28,6 @@
 #include "nvs_flash.h"
 #include <esp_system.h>
 
-
 #include "driver/gpio.h"
 #include "esp_eth_enc28j60.h"
 #include "driver/spi_master.h"
@@ -49,6 +47,9 @@
 
 #include "Filter.h"
 #include "saric_energy.h"
+#include "saric_metrics.h"
+
+#include "cJSON.h"
 
 
 i2c_port_t i2c_num;
@@ -62,7 +63,7 @@ float internal_temp;
 static EventGroupHandle_t s_wifi_event_group;
 uint8_t s_wifi_retry_num = 0;
 
-static const char *TAG = "energy-monitor";
+char *TAG = "energy-monitor";
 static httpd_handle_t start_webserver(void);
 static esp_err_t prom_metrics_get_handler(httpd_req_t *req);
 
@@ -75,6 +76,8 @@ uint32_t eth_link = 0;
 uint32_t wifi_link = 0;
 uint32_t mqtt_link = 0;
 
+uint8_t wifi_rssi = 0;
+uint16_t free_heap = 0;
 
 ezButton button_up(BUTTON_UP);
 ezButton button_down(BUTTON_DOWN);
@@ -160,14 +163,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_ERROR:
 	mqtt_link = MQTT_EVENT_ERROR;
         ESP_LOGE(TAG, "MQTT_EVENT_ERROR, type %d", event->error_handle->error_type);
-        /*
-	if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-            log_error_if_nonzero("reported from esp-tls", event->error_handle->esp_tls_last_esp_err);
-            log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
-            log_error_if_nonzero("captured as transport's socket errno",  event->error_handle->esp_transport_sock_errno);
-            ESP_LOGI(TAG, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
-        }
-	*/
         break;
     default:
         ESP_LOGI(TAG, "Other event id:%d", event->event_id);
@@ -251,9 +246,86 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
 /* An HTTP GET handler */
 static esp_err_t prom_metrics_get_handler(httpd_req_t *req)
 { 
-    const char* resp_str = (const char*) "mrd";
+    char resp_str[2048];
+    strcpy(resp_str, "");
     httpd_resp_set_type(req, (const char*) "text/plain");
+
+    prom_metric_up(resp_str);
+    prom_metric_device_status(resp_str);
+    prom_metric_energy_status(resp_str);
+    httpd_resp_send_chunk(req, resp_str, HTTPD_RESP_USE_STRLEN);
+
+    strcpy(resp_str, "");
+    prom_metric_energy_group_status(resp_str);
+    httpd_resp_send_chunk(req, resp_str, HTTPD_RESP_USE_STRLEN);
+
+    strcpy(resp_str, "");
+    httpd_resp_send_chunk(req, resp_str, 0);
+
+    return ESP_OK;
+}
+
+
+/* An HTTP GET handler */
+static esp_err_t configurations_get_handler(httpd_req_t *req)
+{
+    char resp_str[2048];
+    strcpy(resp_str, "");
+    json_device_config(resp_str);
+    httpd_resp_set_type(req, (const char*) "application/json");
     httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/* An HTTP POST handler */
+static esp_err_t configurations_post_handler(httpd_req_t *req)
+{
+    cJSON *root; 
+    char resp_str[2048];
+    size_t recv_size;
+    int ret;
+    char str_idx[4];
+    recv_size = MIN(req->content_len, sizeof(resp_str));
+    ret = httpd_req_recv(req, resp_str, recv_size);
+    if (ret <= 0) 
+        {
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT) 
+	    {
+            httpd_resp_send_408(req);
+	    }
+	return ESP_FAIL;
+        }
+
+    root = cJSON_Parse(resp_str);
+    //char *json_text = cJSON_Print(root);
+    
+    cJSON *json_network = NULL;
+    cJSON *json_energy = NULL;
+    cJSON *tmp_energy = NULL;
+    json_network = cJSON_GetObjectItem(root, "network");
+    json_energy = cJSON_GetObjectItem(root, "energy");
+
+    if (json_network)
+        {
+        ret = setting_network_json(json_network);
+        save_setup_network();
+        }
+
+    if (json_energy)
+        {
+        for (uint8_t idx = 0; idx < MAX_ADC_INPUT; idx++)
+	    {
+            itoa(idx, str_idx, 10);
+	    tmp_energy = cJSON_GetObjectItem(json_energy, str_idx);
+	    if (tmp_energy)
+	        {
+	        energy_set_all_from_json(idx, tmp_energy);
+		}
+	    }
+        }
+
+    cJSON_Delete(root);
+    httpd_resp_sendstr(req, "OK\n");
     return ESP_OK;
 }
 
@@ -268,22 +340,39 @@ static const httpd_uri_t prom_metrics = {
 };
 
 
+static const httpd_uri_t get_configurations = {
+    .uri       = "/conf",
+    .method    = HTTP_GET,
+    .handler   = configurations_get_handler,
+    .user_ctx  = 0
+};
+
+
+static const httpd_uri_t post_configurations = {
+        .uri = "/conf",
+        .method = HTTP_POST,
+        .handler = configurations_post_handler,
+        .user_ctx = 0
+    };
+
 
  
 static httpd_handle_t start_webserver(void)
 {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 16000;
     config.lru_purge_enable = true;
-
+    config.server_port = device.http_port;
     // Start the httpd server
-    ESP_LOGI(TAG, "Starting server on port: '%d'", 80);
+    ESP_LOGI(TAG, "Starting server on port: '%d'", device.http_port);
     if (httpd_start(&server, &config) == ESP_OK) {
         ESP_LOGI(TAG, "Registering URI handlers");
         httpd_register_uri_handler(server, &prom_metrics);
+        httpd_register_uri_handler(server, &get_configurations);
+        httpd_register_uri_handler(server, &post_configurations);
         return server;
     }
-
     ESP_LOGI(TAG, "Error starting server!");
     return NULL;
 }
@@ -310,32 +399,6 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
 }
 
 
-static void stop_webserver(httpd_handle_t server)
-{
-    // Stop the httpd server
-    httpd_stop(server);
-}
-
-static void disconnect_handler(void* arg, esp_event_base_t event_base,
-                               int32_t event_id, void* event_data)
-{
-    httpd_handle_t* server = (httpd_handle_t*) arg;
-    if (*server) {
-        ESP_LOGI(TAG, "Stopping webserver");
-        stop_webserver(*server);
-        *server = NULL;
-    }
-}
-
-static void connect_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
-{
-    httpd_handle_t* server = (httpd_handle_t*) arg;
-    if (*server == NULL) {
-        ESP_LOGI(TAG, "Starting webserver");
-        *server = start_webserver();
-    }
-}
-
 void time_sync_notification_cb(struct timeval *tv)
 {
     ESP_LOGI(TAG, "Notification of a time synchronization event");
@@ -346,7 +409,7 @@ void time_sync_notification_cb(struct timeval *tv)
 void setup(void)
 {
   esp_eth_handle_t eth_handle = NULL;
-  static httpd_handle_t http_server = NULL;
+  //static httpd_handle_t http_server = NULL;
 
   esp_mqtt_client_config_t mqtt_cfg = {};
   char hostname[10];
@@ -396,6 +459,7 @@ void setup(void)
          device.mqtt_server[0] = 192; device.mqtt_server[1] = 168; device.mqtt_server[2] = 2; device.mqtt_server[3] = 1;
          device.ntp_server[0] = 192; device.ntp_server[1] = 168; device.ntp_server[2] = 2; device.ntp_server[3] = 1;
          device.mqtt_port = 1883;
+         device.http_port = 80;
 	 device.via = 1 << ENABLE_CONNECT_ETH | 1 << ENABLE_CONNECT_WIFI;
 	 strcpy(device.nazev, "MONITOR1");
          strcpy(device.mqtt_user, "saric");
@@ -522,7 +586,7 @@ void setup(void)
       GLCD_GotoXY(0, 0);
       GLCD_PrintString(".. init ...");
       GLCD_GotoXY(0, 16);
-      GLCD_PrintString("4. Network runtime");
+      GLCD_PrintString("4. Network netif ");
       GLCD_Render();
       }
     ///
@@ -619,7 +683,6 @@ void setup(void)
       ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &eth_handle));
 
       /* ENC28J60 doesn't burn any factory MAC address, we need to set it manually.
-         02:00:00 is a Locally Administered OUI range so should not be used except when testing on a LAN under your control.
       */
       mac->set_addr(mac, device.mac);
 
@@ -647,12 +710,12 @@ void setup(void)
       if (device.dhcp == DHCP_DISABLE)
 	  {
           ESP_LOGI(TAG, "DHCP client disable");
-          if ((device.via & (1<<ENABLE_CONNECT_ETH)) != 0)
+          if ((device.via & (ENABLE_CONNECT_ETH)) != 0)
 	      {
               ESP_ERROR_CHECK(esp_netif_dhcpc_stop(eth_netif));
 	      ESP_LOGI(TAG, "DHCP client for Ethernet not enabled");
 	      }
-	  if ((device.via & (1<<ENABLE_CONNECT_WIFI)) != 0)
+	  if ((device.via & (ENABLE_CONNECT_WIFI)) != 0)
 	     {
 	     ESP_ERROR_CHECK(esp_netif_dhcpc_stop(wifi_netif));
 	     ESP_LOGI(TAG, "DHCP client for Wifi not enabled");
@@ -684,7 +747,7 @@ void setup(void)
       ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_S_DUPLEX_MODE, &duplex));
 
       /* start Ethernet driver state machine */
-      if ((device.via & (1<<ENABLE_CONNECT_ETH)) != 0)
+      if ((device.via & (ENABLE_CONNECT_ETH)) != 0)
 	 {
          ESP_ERROR_CHECK(esp_eth_start(eth_handle));
 	 ESP_LOGI(TAG, "Started Ethernet interface");
@@ -695,7 +758,7 @@ void setup(void)
 	 }
 
 
-      if ((device.via & (1<<ENABLE_CONNECT_WIFI)) != 0)
+      if ((device.via & (ENABLE_CONNECT_WIFI)) != 0)
          {
 	  ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
           ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
@@ -760,8 +823,8 @@ void setup(void)
 
   if (init == 8)
       {
-      ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &connect_handler, &http_server));
-      ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ETHERNET_EVENT_DISCONNECTED, &disconnect_handler, &http_server));
+      ESP_LOGI(TAG, "Starting webserver");
+      start_webserver();
       GLCD_SetFont(Font5x8, 5, 8, GLCD_Overwrite);
       GLCD_Clear();
       GLCD_GotoXY(0, 0);
@@ -773,6 +836,14 @@ void setup(void)
 
   if (init == 9)
      {
+      GLCD_SetFont(Font5x8, 5, 8, GLCD_Overwrite);
+      GLCD_Clear();
+      GLCD_GotoXY(0, 0);
+      GLCD_PrintString(".. init ...");
+      GLCD_GotoXY(0, 11);
+      GLCD_PrintString("9. MQTT start");
+      GLCD_Render();
+
       send_mqtt_set_header(monitor_header_out);
       strcpy(complete_ip_uri, "mqtt://");
       createString(ip_uri, '.', device.mqtt_server, 4, 10, 1);
@@ -784,6 +855,8 @@ void setup(void)
 
       esp_mqtt_client_register_event(mqtt_client, (esp_mqtt_event_id_t) ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
       esp_mqtt_client_start(mqtt_client);
+
+
       ESP_LOGI(TAG, "mqtt client start");
       GLCD_SetFont(Font5x8, 5, 8, GLCD_Overwrite);
       GLCD_Clear();
@@ -810,36 +883,34 @@ void setup(void)
 
   if (init == 10)
      {
+      adc_oneshot_unit_init_cfg_t init_config1 = {
+          .unit_id = ADC_UNIT_1,
+      };
+      ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
 
-    adc_oneshot_unit_init_cfg_t init_config1 = {
-        .unit_id = ADC_UNIT_1,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+      adc_oneshot_chan_cfg_t config = {
+          .atten = ADC_ATTEN_DB_11,
+          .bitwidth = ADC_BITWIDTH_DEFAULT
+      };
+      
+      ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_F1, &config));
+      ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_F2, &config));
+      ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_F3, &config));
+      ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_F4, &config));
+      ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_F5, &config));
+      ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_F6, &config));
 
-    adc_oneshot_chan_cfg_t config = {
-        .atten = ADC_ATTEN_DB_11,
-        .bitwidth = ADC_BITWIDTH_DEFAULT
-    };
-    
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_F1, &config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_F2, &config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_F3, &config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_F4, &config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_F5, &config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_F6, &config));
+      adc_calibration_init(ADC_UNIT_1, ADC_ATTEN_DB_11, &adc1_cali_handle);
 
+      energy_struct_init();
 
-     adc_calibration_init(ADC_UNIT_1, ADC_ATTEN_DB_11, &adc1_cali_handle);
-
-     energy_struct_init();
-
-     GLCD_SetFont(Font5x8, 5, 8, GLCD_Overwrite);
-     GLCD_Clear();
-     GLCD_GotoXY(0, 0);
-     GLCD_PrintString(".. init ...");
-     GLCD_GotoXY(0, 10);
-     GLCD_PrintString("10. ADC");
-     GLCD_Render();
+      GLCD_SetFont(Font5x8, 5, 8, GLCD_Overwrite);
+      GLCD_Clear();
+      GLCD_GotoXY(0, 0);
+      GLCD_PrintString(".. init ...");
+      GLCD_GotoXY(0, 10);
+      GLCD_PrintString("10. ADC");
+      GLCD_Render();
      }
 
 
@@ -875,8 +946,8 @@ void setup(void)
      button_up.setDebounceTime(10);
      button_down.setDebounceTime(10);
      button_enter.setDebounceTime(10);
-     generic_input.setDebounceTime(250);
-     S0_contact.setDebounceTime(250);
+     generic_input.setDebounceTime(100);
+     S0_contact.setDebounceTime(100);
      CrossDetector.setDebounceTime(1);
 
      GLCD_SetFont(Font5x8, 5, 8, GLCD_Overwrite);
@@ -890,10 +961,18 @@ void setup(void)
 
   if (init == 12)
      {
+     GLCD_SetFont(Font5x8, 5, 8, GLCD_Overwrite);
+     GLCD_Clear();
+     GLCD_GotoXY(0, 0);
+     GLCD_PrintString(".. init ...");
+     GLCD_GotoXY(0, 11);
+     GLCD_PrintString("12. NTP time start");
+     GLCD_Render();
+
      sntp_setoperatingmode(SNTP_OPMODE_POLL);
      createString(ip_uri, '.', device.ntp_server, 4, 10, 1);
      sntp_setservername(0, ip_uri);
-     sntp_set_sync_interval(60000);
+     sntp_set_sync_interval(360000);
      sntp_set_time_sync_notification_cb(time_sync_notification_cb);
      sntp_init();
      char strftime_buf[64];
@@ -907,7 +986,7 @@ void setup(void)
 
      while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
          ESP_LOGI(TAG, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
-         vTaskDelay(2000 / portTICK_PERIOD_MS);
+         vTaskDelay(1000 / portTICK_PERIOD_MS);
      }
 
      setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
@@ -928,8 +1007,6 @@ void setup(void)
 	 GLCD_PrintString("12. NTP time - OK");
      GLCD_Render();
      }
-
-  vTaskDelay(500 / portTICK_PERIOD_MS);
   }
 }
 
@@ -986,7 +1063,7 @@ bool adc_calibration_init(adc_unit_t unit, adc_atten_t atten, adc_cali_handle_t 
 
 void adc_data(void)
 {
-     long int avg;
+     uint32_t avg;
      uint32_t vmin, vmax, current;
      uint32_t amper1 = 0;
      uint32_t amper2 = 0;
@@ -994,7 +1071,7 @@ void adc_data(void)
      int voltage = 0; 
      int raw_voltage = 0;
 
-     long int diff_period = 0;
+     uint32_t diff_period = 0;
 
      struct_energy_t energyx;
 
@@ -1003,10 +1080,10 @@ void adc_data(void)
         energy_get_parametr(idx, &energyx);
         if (energyx.used == 1)
 	   {
-	   if (millis() - energyx.last_period >= energyx.period)
+	   if ((millis() - energyx.last_period) >= energyx.period && (millis() > energyx.last_period))
 	      {
 	      diff_period = millis() - energyx.last_period;
-	      energyx.last_period += energyx.period;
+	      energyx.last_period = energyx.last_period + energyx.period;
               vmax = 0;
 	      vmin = 65535;
 	      avg = 0;
@@ -1103,12 +1180,11 @@ void adc_data(void)
 }
 
 
-long int millis(void)
+uint32_t millis(void)
 {
   return _millis;
 }
 
-///void callback_1_milisec(void* arg)
 void callback_1_milisec(void)
 {
   _millis++;
@@ -1143,6 +1219,9 @@ void core0Task( void * pvParameters )
   uint8_t _button_enter_state = BUTTON_RELEASED;
   
   uint8_t _generic_input_state = BUTTON_RELEASED;
+  uint8_t _S0_contact_state = BUTTON_RELEASED;
+  uint8_t _CrossDetecot_state = BUTTON_RELEASED;
+
 
   uint32_t next_10s = uptime;
   uint32_t next_20s = uptime;
@@ -1170,6 +1249,20 @@ void core0Task( void * pvParameters )
        _generic_input_state = BUTTON_RELEASED;
        send_mqtt_general_payload(mqtt_client, "input", "off");
        }
+
+    if (S0_contact.isPressed() && _S0_contact_state == BUTTON_RELEASED)
+       {
+       _S0_contact_state = BUTTON_PRESSED;
+       send_mqtt_general_payload(mqtt_client, "S0_contact", "on"); 
+       }
+
+    if (S0_contact.isReleased() && _S0_contact_state == BUTTON_PRESSED)
+       {
+       _S0_contact_state = BUTTON_RELEASED;
+       send_mqtt_general_payload(mqtt_client, "S0_contact", "off");
+       }
+
+
 
 
     if (button_up.isPressed() && _button_up_state == BUTTON_RELEASED)
@@ -1237,6 +1330,7 @@ void core0Task( void * pvParameters )
        next_10s += 10;
        if (mqtt_link == MQTT_EVENT_CONNECTED)
           {
+	  get_device_status();
           send_mqtt_status(mqtt_client);
           update_know_mqtt_device();
           send_know_device();
@@ -1405,13 +1499,21 @@ void send_know_device(void)
 }
 
 
+void get_device_status(void)
+{
+   wifi_ap_record_t wifidata;
+   if (esp_wifi_sta_get_ap_info(&wifidata)==0)
+     {
+     wifi_rssi = 255 - wifidata.rssi;
+     }
+
+   free_heap = esp_get_free_heap_size();
+}
+
 void send_device_status(void)
 {
   char str_topic[32];
   char payload[16];
-  long time_now=0;
-
-  wifi_ap_record_t wifidata;
 
   strcpy(str_topic, "status/uptime");
   sprintf(payload, "%ld", uptime);
@@ -1427,83 +1529,62 @@ void send_device_status(void)
   else
       send_mqtt_general_payload(mqtt_client, "status/eth/link", "no-link");
 
-  if (esp_wifi_sta_get_ap_info(&wifidata)==0)
-     {
-     itoa(wifidata.rssi, payload, 10);
-     send_mqtt_general_payload(mqtt_client, "status/wifi/rssi", payload);
-     }
-
-  //dtostrf(internal_temp, 4, 2, payload);
-  //send_mqtt_general_payload(mqtt_client, "status/internal_temp", payload);
-
-  time_now = DateTime(__DATE__, __TIME__).unixtime();
-  sprintf(payload, "%ld", time_now);
-  send_mqtt_general_payload(mqtt_client, "status/build_time", payload);
-
-  itoa(esp_get_free_heap_size()/1024, payload, 10);
+  itoa(free_heap, payload, 10);
   send_mqtt_general_payload(mqtt_client, "status/heap", payload);
 }
 
 
 void send_energy_status(void)
 {
-   char payload[16];
-   struct_energy_t energyx;
-   for (uint8_t idx =0; idx < MAX_ADC_INPUT; idx++)
-   {
-      energy_get_all_parametr(idx, &energyx);
-      if (energyx.used == 1)
-        {
-	//itoa(energyx.used, payload, 10);
-	//send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "used", payload);
+    char payload[16];
+    struct_energy_t energyx;
+    int32_t miliwats_now[MAX_ADC_INPUT];
+    int32_t total_miliwats[MAX_ADC_INPUT];
+    for (uint8_t idx = 0; idx < MAX_ADC_INPUT; idx++)
+    {
+       energy_get_all_parametr(idx, &energyx);
+       if (energyx.used == 1)
+         {
+         send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "name", energyx.name);
 
-        //send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "name", energyx.name);
+         itoa(energyx.total_watt, payload, 10);
+         send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "total_watt", payload);
 
-	//itoa(energyx.input, payload, 10);
-        //send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "input", payload);
+         itoa(energyx.current_now, payload, 10);
+         send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "current_now", payload);
 
-	//itoa(energyx.period, payload, 10);
-        //send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "period", payload);
+         itoa((energyx.current_now * energyx.volt)/1000, payload, 10);
+         send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "consume_watt", payload);
+         }
+    }
 
-	//itoa(energyx.samples, payload, 10);
-        //send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "samples", payload);
-
-	//itoa(energyx.id, payload, 10);
-        //send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "id", payload);
-
-	//itoa(energyx.type, payload, 10);
-        //send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "type", payload);
-
-	//itoa(energyx.group, payload, 10);
-        //send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "group", payload);
-
-	//itoa(energyx.noise_limit, payload, 10);
-        //send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "noise_limit", payload);
-
-	//itoa(energyx.volt, payload, 10);
-        //send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "volt", payload);
-
-        itoa(energyx.total_watt, payload, 10);
-        send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "total_watt", payload);
-
-	//itoa(energyx.total_second, payload, 10);
-        //send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "total_second", payload);
-
-	itoa(energyx.current_now, payload, 10);
-        send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "current_now", payload);
-
-	//itoa(energyx.checkpoint, payload, 10);
-        //send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "checkpoint", payload);
-
-	itoa((energyx.current_now * energyx.volt)/1000, payload, 10);
-	send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "consume", payload);
+    for (uint8_t idx = 0; idx < MAX_ADC_INPUT; idx++)
+    {
+        total_miliwats[idx] = 0;
+	miliwats_now[idx] = 0;
+        energy_get_all_parametr(idx, &energyx);
+        if ((energyx.used == 1) && (energyx.group < MAX_ADC_INPUT))
+	{
+	    if ((energyx.flags & (1 << flag_direction_current)) == 0)
+                {
+                miliwats_now[energyx.group] = miliwats_now[energyx.group] + (energyx.current_now * energyx.volt);
+                total_miliwats[energyx.group] = total_miliwats[energyx.group] + energyx.total_watt;
+                }
+            else
+                {
+                miliwats_now[energyx.group] = miliwats_now[energyx.group] - (energyx.current_now * energyx.volt);
+                total_miliwats[energyx.group] = total_miliwats[energyx.group] - energyx.total_watt;
+                }
 	}
-      //else
-	//{
-	//itoa(energyx.used, payload, 10);
-        //send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy", idx, "used", payload);
-	//}
-   }
+    }
+
+    for (uint8_t idx = 0; idx < MAX_ADC_INPUT; idx++)
+    {
+        ltoa(total_miliwats[idx]/1000, payload, 10);
+        send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy-group", idx, "total_watt", payload);
+	ltoa(miliwats_now[idx]/1000, payload, 10);
+        send_mqtt_message_prefix_id_topic_payload(mqtt_client, "energy-group", idx, "consume_watt", payload);
+    }
 }
 
 
@@ -1524,14 +1605,9 @@ void mqtt_callback(char* topic, uint8_t * payload, unsigned int length_topic, un
   char str1[64];
   char my_payload[128];
   char my_topic[128];
-  uint8_t cnt = 0;
   uint8_t id = 0;
-  char *pch;
-  uint8_t active;
   struct_energy_t energyx;
 
-  //NTPClient timeClient(udpClient);
-  //DateTime ted;
   memset(my_payload, 0, 128);
   memset(my_topic, 0, 128);
   ////
@@ -1571,44 +1647,6 @@ void mqtt_callback(char* topic, uint8_t * payload, unsigned int length_topic, un
     }
   }
 
-  ////
-  // /monitor-in/NAZEV/energy/set/IDcko/name
-  strcpy_P(str1, monitor_header_in);
-  strcat(str1, device.nazev);
-  strcat(str1, "/energy/set/");
-  if (strncmp(str1, my_topic, strlen(str1)) == 0)
-  {
-    mqtt_process_message++;
-    mqtt_callback_prepare_topic_array(str1, my_topic);
-    cnt = 0;
-    pch = strtok (str1, "/");
-    while (pch != NULL)
-    {
-      if (cnt == 0) id = atoi(pch);
-      if ((id < MAX_ADC_INPUT) && (cnt == 1))
-      {
-	energy_get_all_parametr(id, &energyx);
-        if (strcmp(pch, "name") == 0)  strcpy(energyx.name, my_payload);
-        if (strcmp(pch, "active") == 0)  energyx.used = atoi(my_payload);
-	if (strcmp(pch, "period") == 0)  energyx.period = atoi(my_payload);
-	if (strcmp(pch, "samples") == 0)  energyx.samples = atoi(my_payload);
-	if (strcmp(pch, "type") == 0)  energyx.type = atoi(my_payload);
-	if (strcmp(pch, "group") == 0)  energyx.group = atoi(my_payload);
-	if (strcmp(pch, "noise_limit") == 0)  energyx.noise_limit = atoi(my_payload);
-	if (strcmp(pch, "id") == 0)  energyx.id = atoi(my_payload);
-	if (strcmp(pch, "input") == 0)  energyx.input = atoi(my_payload);
-	energy_set_all_parametr(id, energyx);
-	energy_store_update_all(id, energyx);
-      }
-      else
-      {
-        /////log_error(&mqtt_client, "E");
-        //break;
-      }
-      pch = strtok (NULL, "/");
-      cnt++;
-    }
-  }
   // /monitor-in/NAZEV/energy/store
   strcpy_P(str1, monitor_header_in);
   strcat(str1, device.nazev);
@@ -1620,6 +1658,7 @@ void mqtt_callback(char* topic, uint8_t * payload, unsigned int length_topic, un
     id = atoi(my_payload);
     energy_get_all_parametr(id, &energyx);
     energy_store_update_all(id, energyx);
+    ESP_LOGI(TAG, "Persist energy store idx=%d\n", id);
   }
 
   // /monitor-in/NAZEV/energy/store
@@ -1632,6 +1671,7 @@ void mqtt_callback(char* topic, uint8_t * payload, unsigned int length_topic, un
     mqtt_callback_prepare_topic_array(str1, my_topic);
     id = atoi(my_payload);
     energy_struct_default_init_idx(id);
+    ESP_LOGI(TAG, "Reset energy store idx=%d\n", id);
   }
 
 
@@ -1658,37 +1698,6 @@ void mqtt_callback(char* topic, uint8_t * payload, unsigned int length_topic, un
   {
     mqtt_process_message++;
     send_network_config(mqtt_client);
-  }
-  ////
-  /// nastaveni site
-  //// /monitor-in/XXXXX/network/set/mac
-  //// /monitor-in/XXXXX/network/set/ip
-  //// /monitor-in/XXXXX/network/set/netmask
-  //// /monitor-in/XXXXX/network/set/gw
-  //// /monitor-in/XXXXX/network/set/dns
-  //// /monitor-in/XXXXX/network/set/ntp
-  //// /monitor-in/XXXXX/network/set/mqtt_host
-  //// /monitor-in/XXXXX/network/set/mqtt_port
-  //// /monitor-in/XXXXX/network/set/mqtt_user
-  //// /monitor-in/XXXXX/network/set/mqtt_key
-  //// /monitor-in/XXXXX/network/set/name
-  strcpy_P(str1, monitor_header_in);
-  strcat(str1, device.nazev);
-  strcat(str1, "/network/set/");
-  if (strncmp(str1, my_topic, strlen(str1)) == 0)
-  {
-    mqtt_process_message++;
-    cnt = 0;
-    for (uint8_t f = strlen(str1); f < strlen(my_topic); f++)
-    {
-      str1[cnt] = my_topic[f];
-      str1[cnt + 1] = 0;
-      cnt++;
-    }
-    active = setting_network(str1, my_payload);
-    save_setup_network();
-    if (active == 1)
-    	esp_restart();
   }
   //// /monitor-in/XXXXX/reload
   strcpy_P(str1, monitor_header_in);
@@ -1718,7 +1727,6 @@ void mqtt_callback(char* topic, uint8_t * payload, unsigned int length_topic, un
     mqtt_process_message++;
     EEPROM.write(set_default_values, atoi(my_payload));
   }
-
 }
 
 

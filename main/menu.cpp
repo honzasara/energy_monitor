@@ -703,7 +703,7 @@ uint8_t display_menu_default(uint8_t button_up, uint8_t button_down, uint8_t but
    if (eth_link == ETHERNET_EVENT_CONNECTED)
      GLCD_PrintString("ETH:OK");
    else
-     GLCD_PrintString("ETH:nolink");
+     GLCD_PrintString("ETH:err");
    }
 
    if ((menu_params_1[menu_index] % 2) == 1)
@@ -712,7 +712,7 @@ uint8_t display_menu_default(uint8_t button_up, uint8_t button_down, uint8_t but
    if (wifi_link == WIFI_EVENT_STA_CONNECTED)
      GLCD_PrintString("WIFI:OK");
    else
-     GLCD_PrintString("WIF:nolink");
+     GLCD_PrintString("WIFI:err");
    }
 
    if (menu_params_2[menu_index] == 0)
@@ -740,8 +740,6 @@ uint8_t display_menu_default(uint8_t button_up, uint8_t button_down, uint8_t but
      GLCD_PrintString(str1);
      }
 
-
-
    if (menu_params_2[menu_index] == 2)
      {
      energy_get_all_parametr(1, &energyx);
@@ -766,8 +764,6 @@ uint8_t display_menu_default(uint8_t button_up, uint8_t button_down, uint8_t but
      strcat(str1,"");
      GLCD_PrintString(str1);
      }
-
-
 
    if (menu_params_2[menu_index] == 4)
      {
@@ -794,7 +790,6 @@ uint8_t display_menu_default(uint8_t button_up, uint8_t button_down, uint8_t but
      GLCD_PrintString(str1);
      }
 
-
    if (menu_params_2[menu_index] == 6)
      {
      energy_get_all_parametr(3, &energyx);
@@ -819,7 +814,6 @@ uint8_t display_menu_default(uint8_t button_up, uint8_t button_down, uint8_t but
      strcat(str1,"");
      GLCD_PrintString(str1);
      }
-
 
    if (menu_params_2[menu_index] == 8)
      {
@@ -880,7 +874,7 @@ uint8_t display_menu_default(uint8_t button_up, uint8_t button_down, uint8_t but
 	 energy_get_all_parametr(idx, &energyx);
 	 if (energyx.group == 1)
             {
-            if ((energyx & (1 << flag_direction_current)) == 0)
+            if ((energyx.flags & (1 << flag_direction_current)) == 0)
 	        {
 	        total_miliwats = total_miliwats + (energyx.current_now * energyx.volt);
 	        total_miliamp = total_miliamp + energyx.current_now;
@@ -911,7 +905,7 @@ uint8_t display_menu_default(uint8_t button_up, uint8_t button_down, uint8_t but
          energy_get_all_parametr(idx, &energyx);
          if (energyx.group == 2)
             {
-	    if ((energyx & (1 << flag_direction_current)) == 0)
+	    if ((energyx.flags & (1 << flag_direction_current)) == 0)
 		{
                 total_miliwats = total_miliwats + (energyx.current_now * energyx.volt);
                 total_miliamp = total_miliamp + energyx.current_now;

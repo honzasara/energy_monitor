@@ -9,12 +9,39 @@ void energy_struct_default_init(void)
        energy_struct_default_init_idx(idx);
 }
 
+void energy_dump_config(uint8_t idx)
+{
+   struct_energy_t energyx;
+   energy_get_all_parametr(idx, &energyx);
+
+   printf("Dump for energy %d\n", idx);
+   printf("  Millis: %ld\n", millis());
+   printf("  Name: %s\n", energyx.name);
+   printf("  Used: %d\n", energyx.used);
+   printf("  Input: %d\n", energyx.input);
+   printf("  Period: %d\n", energyx.period);
+   printf("  Last_Period: %ld\n", energyx.last_period);
+   printf("  Samples: %d\n", energyx.samples);
+   printf("  ID: %d\n", energyx.id);
+   printf("  Type: %d\n", energyx.type);
+   printf("  Group: %d\n", energyx.group);
+   printf("  TotalWatt: %ld\n", energyx.total_watt);
+   printf("  TotalSecond: %ld\n", energyx.total_second);
+   printf("  NoiseLimit: %d\n", energyx.noise_limit);
+   printf("  Volt: %d\n", energyx.volt);
+   printf("  Milisecond: %ld\n", energyx.milisecond);
+   printf("  Miliwatt: %ld\n", energyx.miliwatt);
+   printf("  Checkpoint: %ld\n", energyx.checkpoint);
+   printf("\n");
+}
+
 void energy_struct_default_init_idx(uint8_t idx)
 {
    struct_energy_t energyx;
    char str1[8];
    sprintf(str1, "mon %d", idx);
    strcpy(energy[idx].name, str1);
+   energy[idx].name[7] = 0;
    energy[idx].used = 1;
    energy[idx].input = idx + 1;
    energy[idx].period = PERIOD_1_S;
@@ -31,6 +58,7 @@ void energy_struct_default_init_idx(uint8_t idx)
    energy[idx].miliwatt = 0;
    energy[idx].checkpoint = uptime;
    energy_get_all_parametr(idx, &energyx);
+   energy_set_all_parametr(idx, energyx);
 
    energy_set_flag(idx, flag_direction_current, current_consume);
    energy_store_update_all(idx, energyx);
@@ -39,7 +67,10 @@ void energy_struct_default_init_idx(uint8_t idx)
 void energy_struct_init(void)
 {
   for (uint8_t idx = 0; idx < MAX_ADC_INPUT; idx++)
+       {
        energy_struct_init_idx(idx);
+       energy_struct_fresh_idx(idx);
+       }
 }
 
 void energy_store_update_all_mess(uint32_t epoch_time)
@@ -82,7 +113,14 @@ void energy_struct_init_idx(uint8_t idx)
 {
    struct_energy_t energyx;
    energy_store_get_all(idx, &energyx);
-   energyx.last_period = 0;
+   energy_set_all_parametr(idx, energyx);
+}
+
+void energy_struct_fresh_idx(uint8_t idx)
+{
+   struct_energy_t energyx;
+   energy_get_all_parametr(idx, &energyx);
+   energyx.last_period = millis();
    energyx.current_now = 0;
    energyx.milisecond = 0;
    energyx.miliwatt = 0;
@@ -139,6 +177,8 @@ void energy_set_parametr(uint8_t idx, struct_energy_t energyx)
 void energy_get_all_parametr(uint8_t idx, struct_energy_t *energyx)
 {
    strcpy(energyx->name, energy[idx].name);
+   energyx->name[7] = 0;
+
    energyx->used = energy[idx].used;
    energyx->input = energy[idx].input;
    energyx->period = energy[idx].period;
@@ -163,6 +203,7 @@ void energy_get_all_parametr(uint8_t idx, struct_energy_t *energyx)
 void energy_set_all_parametr(uint8_t idx, struct_energy_t energyx)
 {
    strcpy(energy[idx].name, energyx.name);
+   energy[idx].name[7] = 0;
    energy[idx].used = energyx.used;
    energy[idx].input = energyx.input;
    energy[idx].period = energyx.period;
@@ -252,3 +293,121 @@ void energy_store_get_all(uint8_t idx, struct_energy_t *energyx)
    energyx->checkpoint = (EEPROM.read((uint16_t)adc_input0 + (idx * adc_input_store_size_byte) + adc_input_store_checkpoint + 0) << 24) + (EEPROM.read((uint16_t)adc_input0 + (idx * adc_input_store_size_byte) + adc_input_store_checkpoint + 1) << 16) + (EEPROM.read((uint16_t)adc_input0 + (idx * adc_input_store_size_byte) + adc_input_store_checkpoint + 2) << 8) + EEPROM.read((uint16_t)adc_input0 + (idx * adc_input_store_size_byte) + adc_input_store_checkpoint + 3);
 }
 
+
+void energy_set_all_from_json(uint8_t idx, cJSON *json_energy)
+{
+    struct_energy_t energyx;
+    uint8_t ret = 0;
+    cJSON *tmp = NULL;
+    energy_get_all_parametr(idx, &energyx);
+
+    /// nastaveni nazvu ADC vstupu
+    tmp = cJSON_GetObjectItem(json_energy, "name");
+    if (tmp)
+    {
+        ret = 1;
+        strncpy(energyx.name, tmp->valuestring, 8);
+	energy_set_all_parametr(idx, energyx);
+	ESP_LOGI(TAG, "Set new name idx=%d, value=%s", idx, energyx.name);
+    }
+    /// nastaveni indexu ADC prevodniku
+    tmp = cJSON_GetObjectItem(json_energy, "input");
+    if (tmp)
+    {
+        ret = 1;
+        energyx.input = tmp->valueint;
+	energy_set_all_parametr(idx, energyx);
+	ESP_LOGI(TAG, "Set new input idx=%d, value=%d", idx, energyx.input);
+    }
+    /// nastaveni merici periody, jak casto se ma merit
+    tmp = cJSON_GetObjectItem(json_energy, "period");
+    if (tmp)
+    {
+        ret = 1;
+        energyx.period = tmp->valueint;
+	energy_set_all_parametr(idx, energyx);
+	ESP_LOGI(TAG, "Set new period idx=%d, value=%d", idx, energyx.period);
+    }
+    /// nastaveni poctu vzorku pro kazdy mereny usek, jedno mereni trva 100usec
+    tmp = cJSON_GetObjectItem(json_energy, "samples");
+    if (tmp)
+    {
+        ret = 1;
+        energyx.samples = tmp->valueint;
+	energy_set_all_parametr(idx, energyx);
+	ESP_LOGI(TAG, "Set new samples idx=%d, value=%d", idx, energyx.samples);
+    }
+    /// nastaveni globalniho ID
+    tmp = cJSON_GetObjectItem(json_energy, "id");
+    if (tmp)
+    {
+        ret = 1;
+        energyx.id = tmp->valueint;
+	energy_set_all_parametr(idx, energyx);
+	ESP_LOGI(TAG, "Set new id idx=%d, value=%d", idx, energyx.id);
+    }
+    /// nastaveni converzniho typu civky
+    tmp = cJSON_GetObjectItem(json_energy, "type");
+    if (tmp)
+    {
+        ret = 1;
+        energyx.type = tmp->valueint;
+	energy_set_all_parametr(idx, energyx);
+	ESP_LOGI(TAG, "Set new type idx=%d, value=%d", idx, energyx.type);
+    }
+    /// nastaveni groupovani mericich ADC
+    tmp = cJSON_GetObjectItem(json_energy, "group");
+    if (tmp)
+    {
+        ret = 1;
+        energyx.group = tmp->valueint;
+	energy_set_all_parametr(idx, energyx);
+	ESP_LOGI(TAG, "Set new group idx=%d, value=%d", idx, energyx.group);
+    }
+    /// nastaveni hranice detekce sumu mereni
+    tmp = cJSON_GetObjectItem(json_energy, "noise_limit");
+    if (tmp)
+    {
+        ret = 1;
+        energyx.noise_limit = tmp->valueint;
+	energy_set_all_parametr(idx, energyx);
+	ESP_LOGI(TAG, "Set new noise_limit idx=%d, value=%d", idx, energyx.noise_limit);
+    }
+    /// nastaveni napeti v siti pro vypocet spotreby 
+    tmp = cJSON_GetObjectItem(json_energy, "volt");
+    if (tmp)
+    {
+        ret = 1;
+        energyx.volt = tmp->valueint;
+	energy_set_all_parametr(idx, energyx);
+	ESP_LOGI(TAG, "Set new volt idx=%d, value=%d", idx, energyx.volt);
+    }
+    /// nastaveni konfiguracnich flagu merice
+    tmp = cJSON_GetObjectItem(json_energy, "flags");
+    if (tmp)
+    {
+        ret = 1;
+        energyx.flags = tmp->valueint;
+	energy_set_all_parametr(idx, energyx);
+	ESP_LOGI(TAG, "Set new flags idx=%d, value=%d", idx, energyx.flags);
+    }
+    /// povoleni tohoto vstupu
+    tmp = cJSON_GetObjectItem(json_energy, "used");
+    if (tmp)
+    {
+        ret = 1;
+        ESP_LOGI(TAG, "Fresh energy struct %d", idx);
+        energy_struct_fresh_idx(idx);
+        energy_get_all_parametr(idx, &energyx);
+	energyx.used = tmp->valueint;
+	energy_set_all_parametr(idx, energyx);
+	ESP_LOGI(TAG, "Set new used idx=%d, value=%d", idx, energyx.used);
+
+    }
+    /// pri zmene si ulozim data
+    if (ret == 1)
+	{
+	energy_store_update_all(idx, energyx);
+	energy_dump_config(idx);
+	}
+}
