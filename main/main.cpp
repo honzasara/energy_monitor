@@ -705,6 +705,7 @@ void setup(void)
     if (init == 7)
       {
       ESP_ERROR_CHECK(esp_netif_set_hostname(eth_netif, device.nazev));
+      ESP_ERROR_CHECK(esp_netif_set_hostname(wifi_netif, device.nazev));
       if (device.dhcp == DHCP_ENABLE)
 	  ESP_LOGI(TAG, "DHCP client enable");
       if (device.dhcp == DHCP_DISABLE)
